@@ -7,8 +7,9 @@ import random
 import os
 import nltk
 
-# --- 0. AI DEPENDENCIES ---
-# Ensure the NLP model has its dictionary ready
+# ==============================
+# 0. NLP SETUP
+# ==============================
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
@@ -18,38 +19,62 @@ except LookupError:
 app = Flask(__name__)
 CORS(app)
 
-# --- 1. SQL DATABASE CONFIGURATION ---
-# Uses SQLite locally (moodsense.db) and PostgreSQL on Render automatically
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///moodsense.db')
+# ==============================
+# 1. DATABASE CONFIG
+# ==============================
+
+DATABASE_URL = os.environ.get('DATABASE_URL')
+
+# Fix for Render / Postgres (required)
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL or 'sqlite:///moodsense.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
 db = SQLAlchemy(app)
 
-# --- 2. SQL MODELS (Tables) ---
+# ==============================
+# 2. MODELS
+# ==============================
+
 class Employee(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), unique=True, nullable=False)
     role = db.Column(db.String(100))
     dept = db.Column(db.String(100))
     static_driver = db.Column(db.String(50), default="Unknown")
-    entries = db.relationship('VibeEntry', backref='employee', lazy=True)
+
+    entries = db.relationship(
+        'VibeEntry',
+        backref='employee',
+        lazy=True,
+        cascade="all, delete-orphan"
+    )
+
 
 class VibeEntry(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     emp_id = db.Column(db.Integer, db.ForeignKey('employee.id'), nullable=False)
-    date = db.Column(db.String(20))
+
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     mood = db.Column(db.String(20))
     battery = db.Column(db.Integer)
     vent_text = db.Column(db.Text)
     sentiment = db.Column(db.Float)
     primary_driver = db.Column(db.String(50))
 
-# --- 3. DATA SEEDING LOGIC ---
+
+# ==============================
+# 3. DATABASE SEEDING
+# ==============================
+
 def seed_data():
     if Employee.query.first():
         return
 
-    print("🌱 Seeding database with rich team data...")
-    
+    print("🌱 Seeding database...")
+
     teams = [
         ("Manu Sharma", "Senior Dev", "Engineering"),
         ("Ishika Agarwal", "UX Lead", "Design"),
@@ -63,34 +88,38 @@ def seed_data():
         ("Anita Desai", "Account Manager", "Sales")
     ]
 
-    drivers = ["Deadlines", "Workload", "Management", "Pay/Comp", "Work-Life Balance"]
+    drivers = ["Deadlines", "Workload", "Management", "Pay/Comp", "Team"]
     moods = ["Energetic", "Tired", "Stressed", "Happy", "Bored", "Anxious"]
-    
-    # Realistic phrases for the AI to analyze during seeding
+
     sample_vents = [
         "Feeling great about the new release!",
-        "Struggling with the current workload, it's a bit much.",
-        "The management team has been very supportive lately.",
-        "Frustrated with the lack of clear communication on this project.",
-        "Excited for the team outing this weekend!",
-        "Worried about the upcoming deadlines, they seem impossible."
+        "Struggling with the workload lately.",
+        "Management has been supportive.",
+        "Communication on this project is unclear.",
+        "Excited for the team outing!",
+        "Worried about upcoming deadlines."
     ]
 
     for name, role, dept in teams:
-        emp = Employee(name=name, role=role, dept=dept, static_driver=random.choice(drivers))
+        emp = Employee(
+            name=name,
+            role=role,
+            dept=dept,
+            static_driver=random.choice(drivers)
+        )
         db.session.add(emp)
-        db.session.flush() 
+        db.session.flush()
 
-        # Generate 7 Days of History for each employee
-        base_date = datetime.now() - timedelta(days=7)
+        base_date = datetime.utcnow() - timedelta(days=7)
+
         for i in range(7):
-            current_date = (base_date + timedelta(days=i)).strftime("%Y-%m-%d")
+            entry_date = base_date + timedelta(days=i)
             vent = random.choice(sample_vents)
             sentiment_score = TextBlob(vent).sentiment.polarity
-            
+
             entry = VibeEntry(
                 emp_id=emp.id,
-                date=current_date,
+                timestamp=entry_date,
                 mood=random.choice(moods),
                 battery=random.randint(25, 95),
                 vent_text=vent,
@@ -100,78 +129,111 @@ def seed_data():
             db.session.add(entry)
 
     db.session.commit()
-    print("✅ Database successfully populated!")
+    print("✅ Database seeded successfully!")
 
-# Initialize Database
+
 with app.app_context():
     db.create_all()
     seed_data()
 
-# --- 4. LOGIC HELPERS ---
+
+# ==============================
+# 4. HELPER LOGIC
+# ==============================
+
 def analyze_risk(avg_battery):
-    if avg_battery < 30: return "High Risk"
-    elif avg_battery < 60: return "Monitor"
+    if avg_battery < 30:
+        return "High Risk"
+    elif avg_battery < 60:
+        return "Monitor"
     return "Stable"
 
-# --- 5. API ENDPOINTS ---
 
+# ==============================
+# 5. API ROUTES
+# ==============================
+
+# ------------------------------
+# Submit Vibe
+# ------------------------------
 @app.route('/api/submit-vibe', methods=['POST'])
 def submit_vibe():
     data = request.json
+
     user_name = data.get('userName', 'Anonymous')
-    
-    # AI Analysis
-    blob = TextBlob(data.get('ventText', ''))
-    sentiment = blob.sentiment.polarity
-    
+    role = data.get('role', "Team Member")
+    dept = data.get('dept', "General")
+
+    vent_text = data.get('ventText', '')
+    sentiment = TextBlob(vent_text).sentiment.polarity
+
     primary_driver = data.get('pressureSource', 'Unknown')
 
-    # Find or Create User
+    # Find or create employee
     target_emp = Employee.query.filter_by(name=user_name).first()
+
     if not target_emp:
         target_emp = Employee(
-            name=user_name, 
-            role=data.get('role', "New Member"), 
-            dept=data.get('dept', "General")
+            name=user_name,
+            role=role,
+            dept=dept,
+            static_driver=primary_driver
         )
         db.session.add(target_emp)
         db.session.commit()
 
-    # Create Entry
+    # Create entry
     new_entry = VibeEntry(
         emp_id=target_emp.id,
-        date=datetime.now().strftime("%Y-%m-%d"),
         mood=data.get('mood'),
         battery=int(data.get('battery', 50)),
-        vent_text=data.get('ventText', ''),
+        vent_text=vent_text,
         sentiment=sentiment,
         primary_driver=primary_driver
     )
-    
+
+    # Update current driver
     target_emp.static_driver = primary_driver
+
     db.session.add(new_entry)
     db.session.commit()
-    
-    return jsonify({"status": "success", "sentiment": sentiment})
 
+    return jsonify({
+        "status": "success",
+        "sentiment": sentiment
+    })
+
+
+# ------------------------------
+# HR Dashboard Data
+# ------------------------------
 @app.route('/api/hr-dashboard', methods=['GET'])
 def get_hr_dashboard():
     employees = Employee.query.all()
+
     employee_list = []
     dept_map = {}
 
     for emp in employees:
-        entries = VibeEntry.query.filter_by(emp_id=emp.id).all()
-        formatted_history = [{
-            "date": e.date, 
-            "battery": e.battery, 
-            "sentiment": e.sentiment
-        } for e in entries]
+        entries = VibeEntry.query.filter_by(emp_id=emp.id)\
+            .order_by(VibeEntry.timestamp.asc())\
+            .all()
+
+        formatted_history = []
+
+        for e in entries:
+            formatted_history.append({
+                "timestamp": e.timestamp.isoformat(),
+                "battery": e.battery,
+                "sentiment": e.sentiment,
+                "primary_driver": e.primary_driver,
+                "vent_text": e.vent_text
+            })
 
         if formatted_history:
             recent = formatted_history[-3:]
             avg_battery = int(sum(d['battery'] for d in recent) / len(recent))
-            current_driver = entries[-1].primary_driver
+            current_driver = formatted_history[-1]["primary_driver"]
         else:
             avg_battery = 50
             current_driver = emp.static_driver
@@ -187,20 +249,30 @@ def get_hr_dashboard():
             "history": formatted_history
         })
 
-        if emp.dept not in dept_map: dept_map[emp.dept] = []
+        if emp.dept not in dept_map:
+            dept_map[emp.dept] = []
+
         dept_map[emp.dept].append(avg_battery)
 
     final_dept_data = []
-    for d, b in dept_map.items():
-        avg = int(sum(b)/len(b))
-        final_dept_data.append({"name": d, "energy": avg})
+
+    for dept, batteries in dept_map.items():
+        avg = int(sum(batteries) / len(batteries))
+        final_dept_data.append({
+            "name": dept,
+            "energy": avg
+        })
 
     return jsonify({
-        "employees": employee_list, 
+        "employees": employee_list,
         "department_data": final_dept_data
     })
 
+
+# ==============================
+# 6. RUN SERVER
+# ==============================
+
 if __name__ == '__main__':
-    # Use environment port for hosting compatibility
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
